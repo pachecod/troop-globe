@@ -1,0 +1,18 @@
+# Render Blueprint: deploys this folder as a static site (no build step).
+# In Render: New > Blueprint, then pick this repository.
+services:
+  - type: web
+    name: troop-globe
+    runtime: static
+    buildCommand: echo "No build step"
+    staticPublishPath: .
+    routes:
+      # Serve the globe at the site root
+      - type: rewrite
+        source: /
+        destination: /globe.html
+    headers:
+      # Make browsers re-check the page, styles, and data after each deploy
+      - path: /*
+        name: Cache-Control
+        value: no-cache

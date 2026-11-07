@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>U.S. Military Presence Worldwide</title>
+    <link rel="stylesheet" href="globe.css" />
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="info-panel">
+            <h3>U.S. Military Presence</h3>
+            <div class="search" role="search">
+                <input id="search-input" type="search" placeholder="Search a country or place…" autocomplete="off" spellcheck="false"
+                       aria-label="Search a country or place" role="combobox" aria-expanded="false" aria-controls="search-results" aria-autocomplete="list">
+                <ul id="search-results" class="search-results" role="listbox" hidden></ul>
+            </div>
+            <p class="intro"><strong>Drag to rotate</strong></p>
+            <p class="intro">Globe spins (use the pause button on the right to stop it)</p>
+            <p id="hover-info">Hover over a country</p>
+            <div class="legend">
+                <div class="legend-title" id="legend-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="legend-content">
+                    <span>Number of Troops</span>
+                    <span class="legend-toggle">+</span>
+                </div>
+                <div class="legend-content collapsed" id="legend-content">
+                    <div class="legend-item"><div class="legend-color none"></div><span>0 (no tint)</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #e7de8e"></div><span>1-100</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #d4b935"></div><span>100-500</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #d29f2d"></div><span>500-1,000</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #d27c2d"></div><span>1,000-5,000</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #d2542d"></div><span>5,000-10,000</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #b92762"></div><span>10,000-20,000</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #99338a"></div><span>20,000-50,000</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background: #6c2799"></div><span>50,000+</span></div>
+                </div>
+            </div>
+            <div class="height-control">
+                <div class="height-row">
+                    <label for="height-slider">Country height</label>
+                    <span id="height-value">0.0×</span>
+                </div>
+                <input type="range" id="height-slider" min="0" max="3" step="0.05" value="0">
+                <div class="height-hint" id="height-hint" role="note">↑ Drag to raise or lower countries by troop count</div>
+            </div>
+        </div>
+    </aside>
+
+    <main class="globe-col">
+        <div id="globe-container"></div>
+        <div class="loading" id="loading">Loading globe…</div>
+
+        <div class="zoom-controls">
+            <button class="zoom-btn" id="zoom-in" title="Zoom In">🔍+</button>
+            <button class="zoom-btn" id="zoom-out" title="Zoom Out">🔍−</button>
+            <div class="spin-controls">
+                <span class="spin-label">Spin</span>
+                <button class="zoom-btn" id="spin-pause" title="Pause rotation">⏸</button>
+            </div>
+        </div>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+    <script type="module">
+        // three must be the same version globe.gl uses, so both share one copy
+        import Globe from 'https://cdn.jsdelivr.net/npm/globe.gl@2.46.2/+esm';
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.185.1/+esm';
+        import * as topojson from 'https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/+esm';
+
+        // Imagery: NASA Blue Marble (public domain), via the three-globe examples
+        const IMG = 'https://cdn.jsdelivr.net/npm/three-globe@2.45.0/example/img/';
+        const CLOUDS_IMG = 'https://cdn.jsdelivr.net/npm/globe.gl@2.46.2/example/clouds/clouds.png';
+        // Natural Earth 1:50m country shapes (small enough for 3D, still includes Bahrain etc.)
+        const COUNTRIES_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-50m.json';
+
+        // Spin speed in degrees per second
+        const spinSpeed = 0.75;
+        let spinPaused = false;
+
+        // Same bins as the flat globe, in muted tones (saturation reduced ~35%)
+        function getColor(troops) {
+            return troops > 50000 ? '#6c2799' :
+                   troops > 20000 ? '#99338a' :
+                   troops > 10000 ? '#b92762' :
+                   troops > 5000  ? '#d2542d' :
+                   troops > 1000  ? '#d27c2d' :
+                   troops > 500   ? '#d29f2d' :
+                   troops > 100   ? '#d4b935' :
+                   troops > 0     ? '#e7de8e' :
+                                    null;
+        }
+
+        // Light tint for small deployments so the satellite image shows through
+        function tintAlpha(troops) {
+            return troops > 20000 ? 0.9 :
+                   troops > 5000  ? 0.85 :
+                   troops > 1000  ? 0.8 :
+                   troops > 100   ? 0.7 :
+                                    0.45;
+        }
+
+        // Lit material for the raised sides, so light and shadow show their height
+        const sideMaterials = {};
+        function sideMaterial(hex) {
+            const key = hex || 'none';
+            if (!sideMaterials[key]) {
+                sideMaterials[key] = hex
+                    ? new THREE.MeshLambertMaterial({ color: hex, transparent: true, opacity: 0.9 })
+                    : new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+            }
+            return sideMaterials[key];
+        }
+
+        // Lighter version of a color, used for country outlines
+        function brighten(hex) {
+            const n = parseInt(hex.slice(1), 16);
+            const mix = c => Math.round(c + (255 - c) * 0.45);
+            return `rgb(${mix(n >> 16)}, ${mix((n >> 8) & 255)}, ${mix(n & 255)})`;
+        }
+
+        function withAlpha(hex, alpha) {
+            const n = parseInt(hex.slice(1), 16);
+            return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+        }
+
+        // Map-file names -> extra troops.csv names that refer to the same place.
+        // (Names that differ only in accents, "&" vs "and", or punctuation match automatically.)
+        const aliases = {
+            'United States of America': ['United States'],
+            'U.S. Virgin Is.': ['US Virgin Islands'],
+            'Dominican Rep.': ['Dominican Republic'],
+            'Bosnia and Herz.': ['Bosnia and Herzegovina'],
+            'Dem. Rep. Congo': ['Congo - Kinshasa', 'Democratic Republic of the Congo'],
+            'Congo': ['Congo - Brazzaville'],
+            'S. Sudan': ['South Sudan'],
+            'Central African Rep.': ['Central African Republic'],
+            'Marshall Is.': ['Marshall Islands'],
+            'Myanmar': ['Myanmar (Burma)'],
+            'Macedonia': ['North Macedonia'],
+            'Serbia': ['Yugoslavia'],
+            'Cabo Verde': ['Cape Verde'],
+            'Micronesia': ['Micronesia (Federated States Of)', 'Federated States of Micronesia'],
+            'Antigua and Barb.': ['Antigua and Barbuda'],
+            'Czechia': ['Czech Republic'],
+            'Timor-Leste': ['East Timor'],
+            'Eq. Guinea': ['Equatorial Guinea'],
+            "Côte d'Ivoire": ['Ivory Coast'],
+            'Solomon Is.': ['Solomon Islands'],
+            'Saint Lucia': ['St. Lucia'],
+            'St. Vin. and Gren.': ['St. Vincent and the Grenadines'],
+            'eSwatini': ['Swaziland']
+        };
+
+        function norm(name) {
+            return name.normalize('NFKD').replace(/[̀-ͯ]/g, '')
+                .toLowerCase().replace(/&/g, 'and').replace(/[^a-z]/g, '');
+        }
+
+        const latitudes = [
+            { lat: 0, color: '#ff6b6b', label: 'Equator' },
+            { lat: 23.5, color: '#ffa500', label: 'Tropic of Cancer' },
+            { lat: -23.5, color: '#ffa500', label: 'Tropic of Capricorn' },
+            { lat: 66.5, color: '#87ceeb', label: 'Arctic Circle' },
+            { lat: -66.5, color: '#87ceeb', label: 'Antarctic Circle' }
+        ].map(l => ({ ...l, coords: Array.from({ length: 361 }, (_, i) => [l.lat, i - 180]) }));
+
+        const cities = [
+            { name: 'Tokyo', lat: 35.6895, lng: 139.6917 },
+            { name: 'New York', lat: 40.7128, lng: -74.0060 },
+            { name: 'London', lat: 51.5074, lng: -0.1276 },
+            { name: 'Paris', lat: 48.8566, lng: 2.3522 },
+            { name: 'Beijing', lat: 39.9042, lng: 116.4074 },
+            { name: 'Moscow', lat: 55.7558, lng: 37.6173 },
+            { name: 'Sydney', lat: -33.8688, lng: 151.2093 },
+            { name: 'Cairo', lat: 30.0444, lng: 31.2357 },
+            { name: 'Mumbai', lat: 19.0760, lng: 72.8777 },
+            { name: 'São Paulo', lat: -23.5505, lng: -46.6333 },
+            { name: 'Los Angeles', lat: 34.0522, lng: -118.2437 },
+            { name: 'Mexico City', lat: 19.4326, lng: -99.1332 },
+            { name: 'Seoul', lat: 37.5665, lng: 126.9780 },
+            { name: 'Berlin', lat: 52.5200, lng: 13.4050 },
+            { name: 'Singapore', lat: 1.3521, lng: 103.8198 },
+            { name: 'Buenos Aires', lat: -34.6037, lng: -58.3816 },
+            { name: 'Cape Town', lat: -33.9249, lng: 18.4241 },
+            { name: 'Bangkok', lat: 13.7563, lng: 100.5018 },
+            { name: 'Dubai', lat: 25.2048, lng: 55.2708 },
+            { name: 'Hong Kong', lat: 22.3193, lng: 114.1694 }
+        ];
+
+        const hoverInfo = document.getElementById('hover-info');
+        // Touch screens have no hover, so tell phone readers to tap instead
+        const idleHoverText = matchMedia('(hover: none)').matches ? 'Tap a country' : 'Hover over a country';
+        hoverInfo.textContent = idleHoverText;
+        const el = document.getElementById('globe-container');
+        let hovered = null;
+
+        // Every country with troops rises with log(troops), so big and small deployments
+        // are both visible. At 1×: 10 troops ≈ 0.04, 250 ≈ 0.06, 36k ≈ 0.09, 1.1M ≈ 0.12 globe radius
+        function altitude(d) {
+            if (d === hovered) return altitudeBase(d) + 0.01;
+            return altitudeBase(d);
+        }
+        // The slider scales the raised part (1× = default, 0 = flat).
+        // The globe starts flat and rises to 1× after a short delay (see "Intro rise" below).
+        let heightScale = 0;
+        const DEFAULT_HEIGHT = 1;
+        const INTRO_DELAY_MS = 10000;
+        let sliderTouched = false;
+        function altitudeBase(d) {
+            if (!d.troops) return 0.004;
+            return 0.004 + heightScale * (0.018 + Math.log10(d.troops + 1) * 0.016);
+        }
+
+        // Re-apply the polygon accessors so a new hovered/selected country is drawn
+        function refreshHighlight() {
+            world.polygonCapColor(world.polygonCapColor()).polygonStrokeColor(world.polygonStrokeColor()).polygonAltitude(altitude);
+        }
+
+        // Where the camera starts, and where clearing the search returns to
+        const HOME_VIEW = { lat: 25, lng: 10 };
+
+        // Starting zoom: 2.2 on wide screens; on narrow (portrait) screens, back the camera
+        // off until the whole globe fits the width with a small margin.
+        function fitAltitude(box) {
+            const halfFov = 25 * Math.PI / 180;   // three.js camera fov is 50° (vertical)
+            const aspect = Math.min(1, box.clientWidth / box.clientHeight);
+            const halfAngle = Math.atan(Math.tan(halfFov) * aspect * 0.85);
+            return Math.max(2.2, 1 / Math.sin(halfAngle) - 1);
+        }
+
+        // animateIn: false skips globe.gl's zoom-from-tiny intro; the globe fades in instead
+        const world = new Globe(el, { animateIn: false })
+            // NASA Blue Marble Next Generation (topography + bathymetry, public domain),
+            // with the ocean recolored toward Google Earth's lighter blue. Original: IMG + 'earth-blue-marble.jpg'
+            .globeImageUrl('earth-texture.jpg')
+            .bumpImageUrl(IMG + 'earth-topology.png')
+            .backgroundColor('rgba(0, 0, 0, 0)') // transparent, so the fixed star background shows through
+            .showAtmosphere(true)
+            .atmosphereColor('#7fb8ff')
+            .atmosphereAltitude(0.18)
+            .width(el.parentElement.clientWidth)
+            .height(el.parentElement.clientHeight)
+            .pointOfView({ ...HOME_VIEW, altitude: fitAltitude(el.parentElement) })
+            .onGlobeReady(() => {
+                document.getElementById('loading').remove();
+                attachClouds();
+                el.classList.add('ready');
+            });
+
+        // Brighter than the default lighting, closer to Google Earth
+        world.lights().forEach(light => {
+            light.intensity *= light.isAmbientLight ? 1.6 : 1.3;
+        });
+
+        // Shiny oceans, matte land (the water mask makes sunlight glint off the sea)
+        new THREE.TextureLoader().load(IMG + 'earth-water.png', tex => {
+            const mat = world.globeMaterial();
+            mat.specularMap = tex;
+            mat.specular = new THREE.Color('#555');
+            mat.shininess = 18;
+            mat.needsUpdate = true;
+        });
+
+        // Slowly drifting cloud layer just above the surface
+        const clouds = new THREE.Mesh(
+            new THREE.SphereGeometry(world.getGlobeRadius() * 1.006, 75, 75),
+            new THREE.MeshPhongMaterial({ transparent: true, opacity: 0.85, depthWrite: false })
+        );
+        // Attach to the globe itself (not the scene) so the clouds grow with it during
+        // globe.gl's zoom-in intro, instead of looming over a tiny Earth. Runs when the
+        // cloud image loads and again when the globe is ready, whichever comes last.
+        let cloudsLoaded = false;
+        function attachClouds() {
+            if (!cloudsLoaded) return;
+            let globeMesh = null;
+            world.scene().traverse(o => { if (o.material === world.globeMaterial()) globeMesh = o; });
+            if (globeMesh) globeMesh.parent.add(clouds);
+        }
+        new THREE.TextureLoader().load(CLOUDS_IMG, tex => {
+            clouds.material.map = tex;
+            clouds.material.needsUpdate = true;
+            cloudsLoaded = true;
+            attachClouds();
+        });
+        (function driftClouds() {
+            clouds.rotation.y += 0.00004;
+            requestAnimationFrame(driftClouds);
+        })();
+
+        // Auto-rotate: OrbitControls speed 1 = 6 degrees per second
+        const controls = world.controls();
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = spinSpeed / 6;
+        function applySpin() {
+            controls.autoRotate = !spinPaused;
+        }
+
+        // Cities
+        function updateCities() {
+            world
+                .labelsData(cities)
+                .labelText('name')
+                .labelSize(1.1)
+                .labelDotRadius(0.45)
+                .labelColor(() => 'rgba(255, 255, 255, 0.95)')
+                .labelResolution(2)
+                .labelAltitude(0.012)
+                .labelLabel(d => `<div class="globe-tooltip"><strong>${d.name}</strong></div>`);
+        }
+
+        // Latitude lines
+        function updateLines() {
+            world
+                .pathsData(latitudes)
+                .pathPoints('coords')
+                .pathPointLat(p => p[0])
+                .pathPointLng(p => p[1])
+                .pathColor(d => withAlpha(d.color, 0.9))
+                .pathDashLength(0.01)
+                .pathStroke(1.5)
+                .pathDashGap(0.008)
+                .pathPointAlt(0.005)
+                .pathLabel(d => `<div class="globe-tooltip"><strong>${d.label}</strong></div>`);
+        }
+
+        // Load troop data, then country shapes
+        fetch('troops.csv')
+            .then(r => r.text())
+            .then(csvText => {
+                const troopsByName = {};
+                Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true }).data
+                    .forEach(row => {
+                        const key = norm(String(row.Country || ''));
+                        troopsByName[key] = (troopsByName[key] || 0) + (row['Troops Deployed'] || 0);
+                    });
+
+                return fetch(COUNTRIES_URL).then(r => r.json()).then(topo => {
+                    const features = topojson.feature(topo, topo.objects.countries).features
+                        .filter(f => f.properties.name !== 'Antarctica');
+                    features.forEach(f => {
+                        const keys = new Set([f.properties.name, ...(aliases[f.properties.name] || [])].map(norm));
+                        f.troops = [...keys].reduce((sum, k) => sum + (troopsByName[k] || 0), 0);
+                    });
+
+                    world
+                        .polygonsData(features)
+                        .polygonCapColor(d => {
+                            const c = getColor(d.troops);
+                            if (!c) return d === hovered ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0)';
+                            return withAlpha(c, d === hovered ? 0.9 : tintAlpha(d.troops));
+                        })
+                        .polygonSideMaterial(d => sideMaterial(d.troops ? getColor(d.troops) : null))
+                        .polygonStrokeColor(d => d === hovered ? '#ffffff' : d.troops > 100 ? brighten(getColor(d.troops)) : 'rgba(255, 255, 255, 0.25)')
+                        .polygonAltitude(altitude)
+                        .polygonCapCurvatureResolution(3)
+                        .polygonsTransitionDuration(700)
+                        .polygonLabel(d => `<div class="globe-tooltip"><strong>${d.properties.name}</strong><br>${d.troops.toLocaleString()} troops</div>`)
+                        .onPolygonHover(d => {
+                            if (holdSearchHighlight) return;
+                            hovered = d;
+                            hoverInfo.innerHTML = d
+                                ? `<strong>${d.properties.name}</strong><br>${d.troops.toLocaleString()} troops`
+                                : idleHoverText;
+                            refreshHighlight();
+                        });
+
+                    buildSearchIndex(features, troopsByName);
+
+                    // Intro rise: flat at first, then slowly raise to the default height,
+                    // unless the reader has already moved the slider
+                    setTimeout(() => {
+                        if (sliderTouched) return;
+                        heightScale = DEFAULT_HEIGHT;
+                        heightSlider.value = DEFAULT_HEIGHT;
+                        heightValue.textContent = DEFAULT_HEIGHT.toFixed(1) + '×';
+                        world.polygonsTransitionDuration(2500).polygonAltitude(altitude);
+                        setTimeout(() => world.polygonsTransitionDuration(700), 2600);
+                        setTimeout(hideHint, HINT_AFTER_RISE_MS);
+                    }, INTRO_DELAY_MS);
+                });
+            })
+            .catch(err => console.error('Error loading globe data:', err));
+
+        updateCities();
+        updateLines();
+
+        // Controls
+
+        // Height slider
+        const heightSlider = document.getElementById('height-slider');
+        const heightValue = document.getElementById('height-value');
+        // Helper hint above the slider: fades ~10 seconds after the intro rise, or as soon
+        // as the slider is used (30-second fallback in case the data never loads)
+        const HINT_AFTER_RISE_MS = 10000;
+        const heightHint = document.getElementById('height-hint');
+        const hideHint = () => heightHint.classList.add('hidden');
+        setTimeout(hideHint, 30000);
+
+        heightSlider.addEventListener('input', () => {
+            hideHint();
+            sliderTouched = true;
+            heightScale = parseFloat(heightSlider.value);
+            heightValue.textContent = heightScale.toFixed(1) + '×';
+            world.polygonAltitude(altitude);
+        });
+
+        document.getElementById('zoom-in').addEventListener('click', () => {
+            const pov = world.pointOfView();
+            world.pointOfView({ altitude: Math.max(0.3, pov.altitude / 1.3) }, 400);
+        });
+        document.getElementById('zoom-out').addEventListener('click', () => {
+            const pov = world.pointOfView();
+            world.pointOfView({ altitude: Math.min(6, pov.altitude * 1.3) }, 400);
+        });
+
+        const spinPauseBtn = document.getElementById('spin-pause');
+        function setSpinPaused(paused) {
+            spinPaused = paused;
+            spinPauseBtn.textContent = spinPaused ? '▶' : '⏸';
+            spinPauseBtn.title = spinPaused ? 'Play rotation' : 'Pause rotation';
+            applySpin();
+        }
+        spinPauseBtn.addEventListener('click', () => setSpinPaused(!spinPaused));
+
+        const legendToggle = document.getElementById('legend-toggle');
+        const legendContent = document.getElementById('legend-content');
+        // The key starts collapsed; click (or Enter/Space) opens it
+        function toggleLegend() {
+            const collapsed = legendContent.classList.toggle('collapsed');
+            legendToggle.querySelector('.legend-toggle').textContent = collapsed ? '+' : '−';
+            legendToggle.setAttribute('aria-expanded', String(!collapsed));
+        }
+        legendToggle.addEventListener('click', toggleLegend);
+        legendToggle.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleLegend(); }
+        });
+
+        // Search: type a country, territory, or a few well-known regions; picking a
+        // result highlights it, stops the spin, and flies the camera there.
+        const searchInput = document.getElementById('search-input');
+        const searchResults = document.getElementById('search-results');
+        let places = [];
+        // After picking a result, keep it highlighted while the camera flies there; the
+        // globe moving under a resting pointer would otherwise "hover" another country.
+        // Released once the reader actually moves the pointer over the globe.
+        let holdSearchHighlight = false;
+        let holdUntil = 0;
+        el.addEventListener('pointermove', e => {
+            if (holdSearchHighlight && Date.now() > holdUntil && (e.movementX || e.movementY)) holdSearchHighlight = false;
+        });
+        el.addEventListener('pointerdown', () => { holdSearchHighlight = false; });
+        let matches = [];
+        let activeIndex = -1;
+
+        // Places in troops.csv that have no shape in the map file
+        const extraPlaces = [
+            { name: 'Gibraltar', lat: 36.14, lng: -5.35, size: 1 },
+            { name: 'Wake Island', lat: 19.28, lng: 166.65, size: 1 }
+        ];
+        // Regions people may search for that the data only counts as part of a country
+        const regions = [  // parent = map name; shown as the country's search name
+            { name: 'Alaska', parent: 'United States of America', lat: 63.5, lng: -152, size: 30 },
+            { name: 'Hawaii', parent: 'United States of America', lat: 20.6, lng: -157.4, size: 7 },
+            { name: 'Okinawa', parent: 'Japan', lat: 26.4, lng: 127.9, size: 2 }
+        ];
+
+        // Center and size of a country's largest piece (so the US centers on the lower 48)
+        function placeView(f) {
+            const polys = f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates;
+            let best = null;
+            polys.forEach(poly => {
+                const lngs = poly[0].map(c => c[0]), lats = poly[0].map(c => c[1]);
+                const b = { minLng: Math.min(...lngs), maxLng: Math.max(...lngs), minLat: Math.min(...lats), maxLat: Math.max(...lats) };
+                b.area = (b.maxLng - b.minLng) * (b.maxLat - b.minLat);
+                if (!best || b.area > best.area) best = b;
+            });
+            return {
+                lat: (best.minLat + best.maxLat) / 2,
+                lng: (best.minLng + best.maxLng) / 2,
+                size: Math.max(best.maxLng - best.minLng, best.maxLat - best.minLat)
+            };
+        }
+
+        function buildSearchIndex(features, troopsByName) {
+            const byName = {};
+            features.forEach(f => {
+                const mapName = f.properties.name;
+                const alts = aliases[mapName] || [];
+                // Prefer a spelled-out name over map abbreviations like "Dem. Rep. Congo"
+                const name = mapName.includes('.') && alts.length ? alts[0] : mapName;
+                const place = { name, keys: [mapName, ...alts].map(norm), troops: f.troops, feature: f, ...placeView(f) };
+                byName[mapName] = place;
+                places.push(place);
+            });
+            extraPlaces.forEach(p => places.push({ ...p, keys: [norm(p.name)], troops: troopsByName[norm(p.name)] || 0 }));
+            regions.forEach(r => {
+                const parent = byName[r.parent];
+                const partOf = parent && (aliases[r.parent] || [parent.name])[0];   // "United States", not "...of America"
+                if (parent) places.push({ ...r, keys: [norm(r.name)], troops: parent.troops, feature: parent.feature, partOf });
+            });
+        }
+
+        function findMatches(query) {
+            const q = norm(query);
+            if (!q) return [];
+            return places
+                .map(p => ({ p, rank: p.keys.some(k => k.startsWith(q)) ? 0 : p.keys.some(k => k.includes(q)) ? 1 : -1 }))
+                .filter(m => m.rank >= 0)
+                .sort((a, b) => a.rank - b.rank || b.p.troops - a.p.troops)
+                .slice(0, 8)
+                .map(m => m.p);
+        }
+
+        function renderResults() {
+            searchResults.replaceChildren();
+            if (!searchInput.value.trim()) return closeResults();
+            if (!matches.length) {
+                const li = document.createElement('li');
+                li.className = 'search-empty';
+                li.textContent = places.length ? 'No matching places' : 'Still loading…';
+                searchResults.append(li);
+            }
+            matches.forEach((p, i) => {
+                const li = document.createElement('li');
+                li.id = 'search-opt-' + i;
+                li.setAttribute('role', 'option');
+                li.setAttribute('aria-selected', String(i === activeIndex));
+                const name = document.createElement('span');
+                name.className = 'search-name';
+                name.textContent = p.name;
+                if (p.partOf) {
+                    const sub = document.createElement('small');
+                    sub.textContent = 'counted in ' + p.partOf;
+                    name.append(sub);
+                }
+                const count = document.createElement('span');
+                count.className = 'search-count';
+                count.textContent = p.troops.toLocaleString();
+                li.append(name, count);
+                li.addEventListener('mousedown', e => { e.preventDefault(); selectPlace(p); });
+                searchResults.append(li);
+            });
+            searchResults.hidden = false;
+            searchInput.setAttribute('aria-expanded', 'true');
+            searchInput.setAttribute('aria-activedescendant', activeIndex >= 0 ? 'search-opt-' + activeIndex : '');
+        }
+
+        function closeResults() {
+            searchResults.hidden = true;
+            searchInput.setAttribute('aria-expanded', 'false');
+            searchInput.removeAttribute('aria-activedescendant');
+            activeIndex = -1;
+        }
+
+        // Spin state from before the first search pick, restored when the search is cleared
+        let selectedPlace = null;
+        let spinPausedBeforeSearch = false;
+
+        function selectPlace(p) {
+            if (!selectedPlace) spinPausedBeforeSearch = spinPaused;
+            selectedPlace = p;
+            searchInput.value = p.name;
+            closeResults();
+            searchInput.blur();   // also drops the phone keyboard so the globe is visible
+            setSpinPaused(true);  // otherwise the spin carries the place out of view
+            hovered = p.feature || null;
+            holdSearchHighlight = true;
+            holdUntil = Date.now() + 1600;
+            refreshHighlight();
+            hoverInfo.innerHTML = `<strong>${p.name}</strong><br>${p.troops.toLocaleString()} troops` +
+                (p.partOf ? `<br><small>No separate count; this is the ${p.partOf} total</small>` : '');
+            // Zoom in closer for small places; back off a bit on narrow screens
+            const narrow = fitAltitude(el.parentElement) / 2.2;
+            const alt = Math.min(2.2, Math.max(0.35, p.size / 28)) * narrow;
+            world.pointOfView({ lat: p.lat, lng: p.lng, altitude: alt }, 1500);
+        }
+
+        // Clearing the search (the X button, Escape, or deleting the text) after a pick
+        // flies back to the starting view and restores the spin
+        function clearSelection() {
+            selectedPlace = null;
+            holdSearchHighlight = false;
+            hovered = null;
+            refreshHighlight();
+            hoverInfo.textContent = idleHoverText;
+            setSpinPaused(spinPausedBeforeSearch);
+            world.pointOfView({ ...HOME_VIEW, altitude: fitAltitude(el.parentElement) }, 1500);
+        }
+
+        searchInput.addEventListener('input', () => {
+            if (!searchInput.value && selectedPlace) clearSelection();
+            matches = findMatches(searchInput.value);
+            activeIndex = matches.length ? 0 : -1;
+            renderResults();
+        });
+        searchInput.addEventListener('keydown', e => {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                if (!matches.length) return;
+                e.preventDefault();
+                const step = e.key === 'ArrowDown' ? 1 : -1;
+                activeIndex = (activeIndex + step + matches.length) % matches.length;
+                renderResults();
+            } else if (e.key === 'Enter') {
+                if (matches[activeIndex]) selectPlace(matches[activeIndex]);
+            } else if (e.key === 'Escape') {
+                closeResults();
+            }
+        });
+        searchInput.addEventListener('focus', () => { if (searchInput.value.trim()) renderResults(); });
+        searchInput.addEventListener('blur', closeResults);
+
+        // Keep the globe sized to its column
+        new ResizeObserver(() => {
+            world.width(el.parentElement.clientWidth).height(el.parentElement.clientHeight);
+        }).observe(el.parentElement);
+    </script>
+</body>
+</html>
